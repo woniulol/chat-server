@@ -11,6 +11,8 @@ use std::time::{Duration, SystemTime};
 
 type Result<T> = result::Result<T, ()>;
 
+const BUFFER_SIZE: usize = 64;
+
 const SAFE_MODE: bool = false;
 const BANNED_LIMIT: Duration = Duration::from_secs(10 * 60);
 const MESSAGE_RATE: Duration = Duration::from_secs(1);
@@ -108,6 +110,18 @@ fn server(message: Receiver<Message>) -> Result<()> {
 
                             // check is valid utf8
                             if str::from_utf8(&bytes).is_ok() {
+                                // Why you probably want to log the message as bytes
+                                // 1. It naturally prevent printing anything sensitive / malicious
+                                // 2. Reduce the possibly of escape sequence which might have
+                                //    control directly to your terminal. (even if we have tried to
+                                //    filter the escape chars)
+                                //
+                                // But as a client, they still need to be aware that they might be
+                                // exposed to certain sensitive and uncomfortable information
+                                // coming from other clients.
+                                //
+                                // So, connecting to the server at your own risk.
+
                                 // populate the message to all clients;
                                 for (addr, client) in allowed_clients.iter() {
                                     if *addr != socket_addr {
@@ -152,8 +166,7 @@ fn process(stream: Arc<TcpStream>, messages: Sender<Message>) -> Result<()> {
         .send(Message::ClientConnected(stream.clone()))
         .map_err(|err| eprintln!("ERROR: could not send message to the server thread: {err}"))?;
 
-    let mut buf = Vec::new();
-    buf.resize(64, 0);
+    let mut buf = vec![0; BUFFER_SIZE];
 
     loop {
         let n = stream.as_ref().read(&mut buf).map_err(|err| {
@@ -167,8 +180,16 @@ fn process(stream: Arc<TcpStream>, messages: Sender<Message>) -> Result<()> {
             return Ok(());
         }
 
+        // Filter out escape sequence
+        let mut bytes: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
+        for c in &buf[0..n] {
+            if *c >= 32 && *c != 127 {
+                bytes.push(*c);
+            }
+        }
+
         messages
-            .send(Message::NewMessage(socket_addr, buf[0..n].to_vec()))
+            .send(Message::NewMessage(socket_addr, bytes))
             .map_err(|err| {
                 eprintln!("ERROR: could not send message to the server thread: {err}");
             })?;
