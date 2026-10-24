@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::io::{Read, Write};
+use std::fmt::Write as _;
+use std::io::{Read, Write as _};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::ops::Deref;
 use std::result;
@@ -9,9 +10,12 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+use getrandom::getrandom;
+
 type Result<T> = result::Result<T, ()>;
 
 const BUFFER_SIZE: usize = 64;
+const TOKEN_SIZE: usize = 16;
 
 const SAFE_MODE: bool = false;
 const BANNED_LIMIT: Duration = Duration::from_secs(10 * 60);
@@ -157,10 +161,49 @@ fn server(message: Receiver<Message>) -> Result<()> {
     }
 }
 
-fn process(stream: Arc<TcpStream>, messages: Sender<Message>) -> Result<()> {
+fn authenticate(stream: Arc<TcpStream>, token: &str) -> Result<()> {
+    let mut buf = vec![0; TOKEN_SIZE * 2];
+    let _ = stream.as_ref().read(&mut buf);
+    let input_token: &str = str::from_utf8(&buf).unwrap();
+
+    if input_token != token {
+        let _ = stream.deref().write("Invalid token\n".as_bytes());
+        return Err(());
+    }
+    Ok(())
+}
+
+fn process(stream: Arc<TcpStream>, messages: Sender<Message>, token: Arc<str>) -> Result<()> {
     let socket_addr = stream
         .peer_addr()
-        .map_err(|err| eprint!("ERROR: could not get socker address: {err}"))?;
+        .map_err(|err| eprint!("ERROR: could not get socket address: {err}"))?;
+
+    let _ = stream
+        .as_ref()
+        .write("Please input the token: ".as_bytes())
+        .map_err(|err| {
+            eprint!(
+                "ERROR: could not write token prompt to address {}: {err}",
+                Sensitive(socket_addr)
+            )
+        });
+
+    authenticate(stream.clone(), &token).map_err(|_| {
+        eprint!("ERROR: client proivd invalid token \n");
+        let _ = stream.shutdown(Shutdown::Both);
+    })?;
+
+    let _ = stream
+        .as_ref()
+        .write("Authentication success!\n".as_bytes())
+        .map_err(|err| {
+            eprint!(
+                "ERROR: could not write authentication success to address {}: {err}",
+                Sensitive(socket_addr)
+            )
+        });
+
+    println!("INFO: client connected form {}", Sensitive(socket_addr));
 
     messages
         .send(Message::ClientConnected(stream.clone()))
@@ -197,6 +240,17 @@ fn process(stream: Arc<TcpStream>, messages: Sender<Message>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    let mut buffer: Vec<u8> = vec![0; TOKEN_SIZE];
+    getrandom(&mut buffer).map_err(|err| eprint!("Failed to generate server token: {err}"))?;
+
+    let mut token: String = String::new();
+    for c in buffer.iter() {
+        write!(&mut token, "{c:02X?}")
+            .map_err(|err| eprint!("Failed to convert server token: {err}"))?;
+    }
+    println!("Server token: {token}",);
+
+    let token: Arc<str> = Arc::from(token);
     let address = "127.0.0.1:8080";
     let listener = TcpListener::bind(address).map_err(|err| {
         eprintln!(
@@ -215,8 +269,9 @@ fn main() -> Result<()> {
             Ok(stream_handle) => {
                 let tx = tx.clone();
                 let stream = Arc::new(stream_handle);
+                let token = Arc::clone(&token);
                 thread::spawn(|| {
-                    let _ = process(stream, tx);
+                    let _ = process(stream, tx, token);
                 });
             }
             Err(err) => eprintln!("Failed to take stream: {err}"),
